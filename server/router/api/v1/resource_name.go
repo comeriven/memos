@@ -4,8 +4,12 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/lithammer/shortuuid/v4"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"github.com/usememos/memos/internal/base"
 	"github.com/usememos/memos/internal/util"
 )
 
@@ -13,12 +17,15 @@ const (
 	InstanceSettingNamePrefix  = "instance/settings/"
 	UserNamePrefix             = "users/"
 	MemoNamePrefix             = "memos/"
+	MemoShareNamePrefix        = "shares/"
 	AttachmentNamePrefix       = "attachments/"
 	ReactionNamePrefix         = "reactions/"
 	InboxNamePrefix            = "inboxes/"
 	IdentityProviderNamePrefix = "identity-providers/"
-	ActivityNamePrefix         = "activities/"
 	WebhookNamePrefix          = "webhooks/"
+	SpaceNamePrefix            = "spaces/"
+	SpaceMemberNamePrefix      = "members/"
+	SpaceInvitationNamePrefix  = "invitations/"
 )
 
 // GetNameParentTokens returns the tokens from a resource name.
@@ -73,17 +80,6 @@ func ExtractUserIDFromName(name string) (int32, error) {
 	return id, nil
 }
 
-// extractUserIdentifierFromName extracts the identifier (ID or username) from a user resource name.
-// Supports: "users/101" or "users/steven"
-// Returns the identifier string (e.g., "101" or "steven").
-func extractUserIdentifierFromName(name string) string {
-	tokens, err := GetNameParentTokens(name, UserNamePrefix)
-	if err != nil || len(tokens) == 0 {
-		return ""
-	}
-	return tokens[0]
-}
-
 // ExtractMemoUIDFromName returns the memo UID from a resource name.
 // e.g., "memos/uuid" -> "uuid".
 func ExtractMemoUIDFromName(name string) (string, error) {
@@ -93,6 +89,39 @@ func ExtractMemoUIDFromName(name string) (string, error) {
 	}
 	id := tokens[0]
 	return id, nil
+}
+
+func buildMemoName(uid string) string {
+	return MemoNamePrefix + uid
+}
+
+// ExtractSpaceUIDFromName returns the UID from a Space resource name.
+func ExtractSpaceUIDFromName(name string) (string, error) {
+	tokens, err := GetNameParentTokens(name, SpaceNamePrefix)
+	if err != nil {
+		return "", err
+	}
+	return tokens[0], nil
+}
+
+// ExtractSpaceMemberTokensFromName returns the Space UID and username from a
+// SpaceMember resource name.
+func ExtractSpaceMemberTokensFromName(name string) (string, string, error) {
+	tokens, err := GetNameParentTokens(name, SpaceNamePrefix, SpaceMemberNamePrefix)
+	if err != nil {
+		return "", "", err
+	}
+	return tokens[0], tokens[1], nil
+}
+
+// ExtractSpaceInvitationTokensFromName returns the Space UID and invitee
+// username from a SpaceInvitation resource name.
+func ExtractSpaceInvitationTokensFromName(name string) (string, string, error) {
+	tokens, err := GetNameParentTokens(name, SpaceNamePrefix, SpaceInvitationNamePrefix)
+	if err != nil {
+		return "", "", err
+	}
+	return tokens[0], tokens[1], nil
 }
 
 // ExtractAttachmentUIDFromName returns the attachment UID from a resource name.
@@ -133,26 +162,33 @@ func ExtractInboxIDFromName(name string) (int32, error) {
 	return id, nil
 }
 
-func ExtractIdentityProviderIDFromName(name string) (int32, error) {
+func ExtractIdentityProviderUIDFromName(name string) (string, error) {
 	tokens, err := GetNameParentTokens(name, IdentityProviderNamePrefix)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	id, err := util.ConvertStringToInt32(tokens[0])
-	if err != nil {
-		return 0, errors.Errorf("invalid identity provider ID %q", tokens[0])
-	}
-	return id, nil
+	return tokens[0], nil
 }
 
-func ExtractActivityIDFromName(name string) (int32, error) {
-	tokens, err := GetNameParentTokens(name, ActivityNamePrefix)
-	if err != nil {
-		return 0, err
+// ValidateAndGenerateUID validates a user-provided UID or generates a new one.
+// If provided is empty, a new shortuuid is generated.
+// If provided is non-empty, it is validated against base.UIDMatcher.
+func ValidateAndGenerateUID(provided string) (string, error) {
+	uid := strings.TrimSpace(provided)
+	if uid == "" {
+		return shortuuid.New(), nil
 	}
-	id, err := util.ConvertStringToInt32(tokens[0])
-	if err != nil {
-		return 0, errors.Errorf("invalid activity ID %q", tokens[0])
+	if !base.UIDMatcher.MatchString(uid) {
+		return "", status.Errorf(codes.InvalidArgument, "invalid UID: must be 1-36 characters, contain only letters, digits, or hyphens, and start and end with a letter or digit")
 	}
-	return id, nil
+	return uid, nil
+}
+
+// ValidateAndGenerateSpaceUID validates a user-provided Space UID or generates a UUID v4.
+// Custom UIDs use the same format as other public-resource UIDs.
+func ValidateAndGenerateSpaceUID(provided string) (string, error) {
+	if strings.TrimSpace(provided) == "" {
+		return util.GenUUID(), nil
+	}
+	return ValidateAndGenerateUID(provided)
 }

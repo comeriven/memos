@@ -58,7 +58,7 @@ func TestMemoRelationStore(t *testing.T) {
 		Type:          store.MemoRelationComment,
 	}
 	_, err = ts.UpsertMemoRelation(ctx, commentRelation)
-	require.NoError(t, err)
+	require.Error(t, err)
 	ts.Close()
 }
 
@@ -106,7 +106,7 @@ func TestMemoRelationListByMemoID(t *testing.T) {
 	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
 		MemoID:        mainMemo.ID,
 		RelatedMemoID: relatedMemo2.ID,
-		Type:          store.MemoRelationComment,
+		Type:          store.MemoRelationReference,
 	})
 	require.NoError(t, err)
 
@@ -124,7 +124,7 @@ func TestMemoRelationListByMemoID(t *testing.T) {
 		Type:   &refType,
 	})
 	require.NoError(t, err)
-	require.Equal(t, 1, len(refRelations))
+	require.Equal(t, 2, len(refRelations))
 	require.Equal(t, store.MemoRelationReference, refRelations[0].Type)
 
 	// List by related memo ID
@@ -195,6 +195,118 @@ func TestMemoRelationDelete(t *testing.T) {
 	ts.Close()
 }
 
+func TestMemoRelationDeleteRequiresExplicitReferenceType(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	defer ts.Close()
+	user, err := createTestingHostUser(ctx, ts)
+	require.NoError(t, err)
+
+	contextMemo, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "delete-guard-context",
+		CreatorID:  user.ID,
+		Content:    "context",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+	comment, err := ts.CreateMemoComment(ctx, &store.Memo{
+		UID:        "delete-guard-comment",
+		CreatorID:  user.ID,
+		Content:    "comment",
+		Visibility: store.Private,
+	}, contextMemo.ID, user.ID)
+	require.NoError(t, err)
+
+	commentType := store.MemoRelationComment
+	referenceType := store.MemoRelationReference
+	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
+		MemoID:        comment.ID,
+		RelatedMemoID: contextMemo.ID,
+		Type:          referenceType,
+	})
+	require.NoError(t, err)
+
+	assertRelationExists := func(t *testing.T, relationType store.MemoRelationType) {
+		t.Helper()
+		relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+			MemoID: &comment.ID,
+			Type:   &relationType,
+		})
+		require.NoError(t, err)
+		require.Len(t, relations, 1)
+		require.Equal(t, contextMemo.ID, relations[0].RelatedMemoID)
+	}
+	assertRelationsExist := func(t *testing.T) {
+		t.Helper()
+		assertRelationExists(t, commentType)
+		assertRelationExists(t, referenceType)
+	}
+	assertRelationsExist(t)
+
+	zeroID := int32(0)
+	negativeID := int32(-1)
+
+	for _, test := range []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "store rejects omitted type",
+			run: func() error {
+				return ts.DeleteMemoRelation(ctx, &store.DeleteMemoRelation{
+					MemoID: &comment.ID, RelatedMemoID: &contextMemo.ID,
+				})
+			},
+		},
+		{
+			name: "driver rejects omitted type",
+			run: func() error {
+				return ts.GetDriver().DeleteMemoRelation(ctx, &store.DeleteMemoRelation{
+					MemoID: &comment.ID, RelatedMemoID: &contextMemo.ID,
+				})
+			},
+		},
+		{
+			name: "driver rejects comment type",
+			run: func() error {
+				return ts.GetDriver().DeleteMemoRelation(ctx, &store.DeleteMemoRelation{
+					MemoID: &comment.ID, RelatedMemoID: &contextMemo.ID, Type: &commentType,
+				})
+			},
+		},
+		{
+			name: "store rejects unscoped reference delete",
+			run: func() error {
+				return ts.DeleteMemoRelation(ctx, &store.DeleteMemoRelation{Type: &referenceType})
+			},
+		},
+		{
+			name: "driver rejects unscoped reference delete",
+			run: func() error {
+				return ts.GetDriver().DeleteMemoRelation(ctx, &store.DeleteMemoRelation{Type: &referenceType})
+			},
+		},
+		{
+			name: "store rejects non-positive memo endpoint",
+			run: func() error {
+				return ts.DeleteMemoRelation(ctx, &store.DeleteMemoRelation{MemoID: &zeroID, Type: &referenceType})
+			},
+		},
+		{
+			name: "driver rejects non-positive related endpoint",
+			run: func() error {
+				return ts.GetDriver().DeleteMemoRelation(ctx, &store.DeleteMemoRelation{RelatedMemoID: &negativeID, Type: &referenceType})
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require.Error(t, test.run())
+			assertRelationsExist(t)
+		})
+	}
+}
+
 func TestMemoRelationDifferentTypes(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -226,20 +338,21 @@ func TestMemoRelationDifferentTypes(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Create comment relation (same memos, different type - should be allowed)
+	// COMMENT context is created atomically with its memo and cannot be
+	// persisted through the generic relation mutation path.
 	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
 		MemoID:        mainMemo.ID,
 		RelatedMemoID: relatedMemo.ID,
 		Type:          store.MemoRelationComment,
 	})
-	require.NoError(t, err)
+	require.Error(t, err)
 
-	// Verify both relations exist
+	// Verify only the reference relation exists.
 	relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
 		MemoID: &mainMemo.ID,
 	})
 	require.NoError(t, err)
-	require.Equal(t, 2, len(relations))
+	require.Len(t, relations, 1)
 
 	ts.Close()
 }
@@ -332,11 +445,11 @@ func TestMemoRelationDeleteByType(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Create comment relation
+	// Create a second reference relation.
 	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
 		MemoID:        mainMemo.ID,
 		RelatedMemoID: relatedMemo2.ID,
-		Type:          store.MemoRelationComment,
+		Type:          store.MemoRelationReference,
 	})
 	require.NoError(t, err)
 
@@ -348,13 +461,12 @@ func TestMemoRelationDeleteByType(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Verify only comment relation remains
+	// Verify all reference relations were deleted.
 	relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
 		MemoID: &mainMemo.ID,
 	})
 	require.NoError(t, err)
-	require.Len(t, relations, 1)
-	require.Equal(t, store.MemoRelationComment, relations[0].Type)
+	require.Empty(t, relations)
 
 	ts.Close()
 }
@@ -405,9 +517,11 @@ func TestMemoRelationDeleteByMemoID(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Delete all relations for memo1
+	// Delete all reference relations for memo1.
+	referenceType := store.MemoRelationReference
 	err = ts.DeleteMemoRelation(ctx, &store.DeleteMemoRelation{
 		MemoID: &memo1.ID,
+		Type:   &referenceType,
 	})
 	require.NoError(t, err)
 
@@ -472,7 +586,7 @@ func TestMemoRelationListByRelatedMemoID(t *testing.T) {
 	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
 		MemoID:        referrer2.ID,
 		RelatedMemoID: targetMemo.ID,
-		Type:          store.MemoRelationComment,
+		Type:          store.MemoRelationReference,
 	})
 	require.NoError(t, err)
 
@@ -528,26 +642,26 @@ func TestMemoRelationListCombinedFilters(t *testing.T) {
 	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
 		MemoID:        mainMemo.ID,
 		RelatedMemoID: relatedMemo2.ID,
-		Type:          store.MemoRelationComment,
+		Type:          store.MemoRelationReference,
 	})
 	require.NoError(t, err)
 
 	// List with MemoID and Type filter
 	refType := store.MemoRelationReference
 	relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
-		MemoID: &mainMemo.ID,
-		Type:   &refType,
+		MemoID:        &mainMemo.ID,
+		RelatedMemoID: &relatedMemo1.ID,
+		Type:          &refType,
 	})
 	require.NoError(t, err)
 	require.Len(t, relations, 1)
 	require.Equal(t, relatedMemo1.ID, relations[0].RelatedMemoID)
 
 	// List with MemoID, RelatedMemoID, and Type filter
-	commentType := store.MemoRelationComment
 	relations, err = ts.ListMemoRelations(ctx, &store.FindMemoRelation{
 		MemoID:        &mainMemo.ID,
 		RelatedMemoID: &relatedMemo2.ID,
-		Type:          &commentType,
+		Type:          &refType,
 	})
 	require.NoError(t, err)
 	require.Len(t, relations, 1)
@@ -638,6 +752,269 @@ func TestMemoRelationBidirectional(t *testing.T) {
 	ts.Close()
 }
 
+func TestMemoRelationListByMemoIDList(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	user, err := createTestingHostUser(ctx, ts)
+	require.NoError(t, err)
+
+	// Create 3 memos.
+	memoA, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-a",
+		CreatorID:  user.ID,
+		Content:    "memo A content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	memoB, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-b",
+		CreatorID:  user.ID,
+		Content:    "memo B content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	memoC, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-c",
+		CreatorID:  user.ID,
+		Content:    "memo C content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	memoD, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-d",
+		CreatorID:  user.ID,
+		Content:    "memo D content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	// A -> B (reference)
+	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
+		MemoID:        memoA.ID,
+		RelatedMemoID: memoB.ID,
+		Type:          store.MemoRelationReference,
+	})
+	require.NoError(t, err)
+
+	// A -> C (reference)
+	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
+		MemoID:        memoA.ID,
+		RelatedMemoID: memoC.ID,
+		Type:          store.MemoRelationReference,
+	})
+	require.NoError(t, err)
+
+	// D -> B (reference) — B appears as related_memo_id
+	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
+		MemoID:        memoD.ID,
+		RelatedMemoID: memoB.ID,
+		Type:          store.MemoRelationReference,
+	})
+	require.NoError(t, err)
+
+	// Batch query for memos A and B: should return all 3 relations
+	// (A->B because A is in list, A->C because A is in list, D->B because B is in list)
+	relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		MemoIDList: []int32{memoA.ID, memoB.ID},
+	})
+	require.NoError(t, err)
+	require.Len(t, relations, 3)
+
+	// Batch query for memo C only: should return 1 relation (A->C because C is related_memo_id)
+	relations, err = ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		MemoIDList: []int32{memoC.ID},
+	})
+	require.NoError(t, err)
+	require.Len(t, relations, 1)
+	require.Equal(t, memoA.ID, relations[0].MemoID)
+	require.Equal(t, memoC.ID, relations[0].RelatedMemoID)
+
+	// Batch query for memo D only: should return 1 relation (D->B because D is memo_id)
+	relations, err = ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		MemoIDList: []int32{memoD.ID},
+	})
+	require.NoError(t, err)
+	require.Len(t, relations, 1)
+	require.Equal(t, memoD.ID, relations[0].MemoID)
+	require.Equal(t, memoB.ID, relations[0].RelatedMemoID)
+
+	ts.Close()
+}
+
+func TestMemoRelationListByMemoIDListEmpty(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	user, err := createTestingHostUser(ctx, ts)
+	require.NoError(t, err)
+
+	memo, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-no-relations",
+		CreatorID:  user.ID,
+		Content:    "memo with no relations",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	// Batch query with a memo that has no relations.
+	relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		MemoIDList: []int32{memo.ID},
+	})
+	require.NoError(t, err)
+	require.Len(t, relations, 0)
+
+	// Empty MemoIDList should not filter by MemoIDList (returns based on other filters).
+	relations, err = ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		MemoIDList: []int32{},
+	})
+	require.NoError(t, err)
+	require.Len(t, relations, 0)
+
+	ts.Close()
+}
+
+func TestMemoRelationListByMemoIDListWithTypeFilter(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	user, err := createTestingHostUser(ctx, ts)
+	require.NoError(t, err)
+
+	memoA, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-a",
+		CreatorID:  user.ID,
+		Content:    "memo A content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	memoB, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-b",
+		CreatorID:  user.ID,
+		Content:    "memo B content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	memoC, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-c",
+		CreatorID:  user.ID,
+		Content:    "memo C content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	// A -> B (reference)
+	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
+		MemoID:        memoA.ID,
+		RelatedMemoID: memoB.ID,
+		Type:          store.MemoRelationReference,
+	})
+	require.NoError(t, err)
+
+	// A -> C (reference)
+	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
+		MemoID:        memoA.ID,
+		RelatedMemoID: memoC.ID,
+		Type:          store.MemoRelationReference,
+	})
+	require.NoError(t, err)
+
+	// Batch query with type filter: only references
+	refType := store.MemoRelationReference
+	relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		MemoIDList: []int32{memoA.ID},
+		Type:       &refType,
+	})
+	require.NoError(t, err)
+	require.Len(t, relations, 2)
+	require.Equal(t, store.MemoRelationReference, relations[0].Type)
+
+	// Batch query with type filter: only comments
+	commentType := store.MemoRelationComment
+	relations, err = ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		MemoIDList: []int32{memoA.ID},
+		Type:       &commentType,
+	})
+	require.NoError(t, err)
+	require.Empty(t, relations)
+
+	ts.Close()
+}
+
+func TestMemoRelationListByMemoIDListBothDirections(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	user, err := createTestingHostUser(ctx, ts)
+	require.NoError(t, err)
+
+	memoA, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-a",
+		CreatorID:  user.ID,
+		Content:    "memo A content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	memoB, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-b",
+		CreatorID:  user.ID,
+		Content:    "memo B content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	memoX, err := ts.CreateMemo(ctx, &store.Memo{
+		UID:        "memo-x",
+		CreatorID:  user.ID,
+		Content:    "memo X content",
+		Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	// X -> A (A appears as related_memo_id)
+	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
+		MemoID:        memoX.ID,
+		RelatedMemoID: memoA.ID,
+		Type:          store.MemoRelationReference,
+	})
+	require.NoError(t, err)
+
+	// A -> B (A appears as memo_id)
+	_, err = ts.UpsertMemoRelation(ctx, &store.MemoRelation{
+		MemoID:        memoA.ID,
+		RelatedMemoID: memoB.ID,
+		Type:          store.MemoRelationReference,
+	})
+	require.NoError(t, err)
+
+	// Query with MemoIDList=[A]: should find both relations (A as source and A as target).
+	relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		MemoIDList: []int32{memoA.ID},
+	})
+	require.NoError(t, err)
+	require.Len(t, relations, 2)
+
+	// Verify we got both directions.
+	memoIDs := map[int32]bool{}
+	relatedIDs := map[int32]bool{}
+	for _, r := range relations {
+		memoIDs[r.MemoID] = true
+		relatedIDs[r.RelatedMemoID] = true
+	}
+	require.True(t, memoIDs[memoX.ID], "should include X->A relation")
+	require.True(t, memoIDs[memoA.ID], "should include A->B relation")
+	require.True(t, relatedIDs[memoA.ID], "should include X->A relation")
+	require.True(t, relatedIDs[memoB.ID], "should include A->B relation")
+
+	ts.Close()
+}
+
 func TestMemoRelationMultipleRelationsToSameMemo(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -679,4 +1056,38 @@ func TestMemoRelationMultipleRelationsToSameMemo(t *testing.T) {
 	require.Len(t, relations, 5)
 
 	ts.Close()
+}
+
+func TestMemoRelationFiltersSourceStatusBeforePagination(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	defer ts.Close()
+	user, err := createTestingHostUser(ctx, ts)
+	require.NoError(t, err)
+	parent, err := ts.CreateMemo(ctx, &store.Memo{UID: "status-parent", CreatorID: user.ID, Content: "parent", Visibility: store.Public})
+	require.NoError(t, err)
+	normalMemo, err := ts.CreateMemo(ctx, &store.Memo{UID: "status-normal", CreatorID: user.ID, Content: "normal", Visibility: store.Public})
+	require.NoError(t, err)
+	archivedMemo, err := ts.CreateMemo(ctx, &store.Memo{UID: "status-archived", CreatorID: user.ID, Content: "archived", Visibility: store.Public})
+	require.NoError(t, err)
+	archived := store.Archived
+	require.NoError(t, ts.UpdateMemo(ctx, &store.UpdateMemo{ID: archivedMemo.ID, RowStatus: &archived}))
+	for _, memoID := range []int32{normalMemo.ID, archivedMemo.ID} {
+		_, err := ts.UpsertMemoRelation(ctx, &store.MemoRelation{MemoID: memoID, RelatedMemoID: parent.ID, Type: store.MemoRelationReference})
+		require.NoError(t, err)
+	}
+
+	normal := store.Normal
+	referenceType := store.MemoRelationReference
+	limit := 1
+	relations, err := ts.ListMemoRelations(ctx, &store.FindMemoRelation{
+		RelatedMemoID:       &parent.ID,
+		Type:                &referenceType,
+		SourceMemoRowStatus: &normal,
+		Limit:               &limit,
+	})
+	require.NoError(t, err)
+	require.Len(t, relations, 1)
+	require.Equal(t, normalMemo.ID, relations[0].MemoID)
 }
